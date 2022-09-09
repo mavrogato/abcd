@@ -3,7 +3,6 @@
 #include <memory>
 #include <string_view>
 #include <filesystem>
-#include <bit>
 #include <complex>
 #include <vector>
 #include <numbers>
@@ -16,6 +15,7 @@
 #include <sys/mman.h>
 #include <linux/input-event-codes.h>
 #include <wayland-client.h>
+#include "xdg-shell-client.h"
 
 inline auto safe_ptr(wl_display* display) noexcept {
     return std::unique_ptr<wl_display, decltype (&wl_display_disconnect)>(display,
@@ -43,10 +43,13 @@ std::is_same_v<WL_CLIENT, wl_shm>           ||
 std::is_same_v<WL_CLIENT, wl_surface>       ||
 std::is_same_v<WL_CLIENT, wl_shell_surface> ||
 std::is_same_v<WL_CLIENT, wl_shm_pool>      ||
+std::is_same_v<WL_CLIENT, zxdg_shell_v6>    ||
+std::is_same_v<WL_CLIENT, zxdg_surface_v6>  ||
+std::is_same_v<WL_CLIENT, zxdg_toplevel_v6> ||
 std::is_same_v<WL_CLIENT, wl_buffer>
 inline auto safe_ptr(WL_CLIENT* ptr) noexcept {
     auto deleter = [](WL_CLIENT* ptr) noexcept {
-        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(ptr));
+        wl_proxy_destroy(sycl::bit_cast<wl_proxy*>(ptr));
     };
     return std::unique_ptr<WL_CLIENT, decltype (deleter)>(ptr, deleter);
 }
@@ -105,7 +108,7 @@ int main() {
         return -1;
     }
     auto compositor = safe_ptr<wl_compositor>(nullptr);
-    auto shell = safe_ptr<wl_shell>(nullptr);
+    auto shell = safe_ptr<zxdg_shell_v6>(nullptr);
     auto seat = safe_ptr<wl_seat>(nullptr);
     auto shm = safe_ptr<wl_shm>(nullptr);
     auto register_globals = [&](auto name, std::string_view interface, auto version) noexcept {
@@ -116,11 +119,11 @@ int main() {
                                                                   &wl_compositor_interface,
                                                                   version)));
         }
-        else if (interface == wl_shell_interface.name) {
-            shell.reset(reinterpret_cast<wl_shell*>(wl_registry_bind(registry.get(),
-                                                                     name,
-                                                                     &wl_shell_interface,
-                                                                     version)));
+        else if (interface == zxdg_shell_v6_interface.name) {
+            shell.reset(reinterpret_cast<zxdg_shell_v6*>(wl_registry_bind(registry.get(),
+                                                                          name,
+                                                                          &zxdg_shell_v6_interface,
+                                                                          version)));
         }
         else if (interface == wl_seat_interface.name) {
             seat.reset(reinterpret_cast<wl_seat*>(wl_registry_bind(registry.get(),
@@ -137,7 +140,7 @@ int main() {
     };
     wl_registry_listener listener {
         .global = [](auto data, auto, auto... args) noexcept {
-            (*reinterpret_cast<decltype (register_globals)*>(data))(args...);
+            (*sycl::bit_cast<decltype (register_globals)*>(data))(args...);
         },
         .global_remove = [](auto...) noexcept {
             std::cerr << "Required global has been removed..." << std::endl;
@@ -156,6 +159,67 @@ int main() {
         std::cerr << "Some required global not found..." << std::endl;
         return -1;
     }
+    size_t cx = 640;
+    size_t cy = 480;
+    uint32_t* pixels = nullptr;
+    auto buffer = safe_ptr(create_shm_buffer(shm.get(), cx, cy, &pixels));
+    if (!buffer || !pixels) {
+        std::cerr << "cannot create shm-buffer..." << std::endl;
+        return -1;
+    }
+    auto surface = safe_ptr(wl_compositor_create_surface(compositor.get()));
+    if (!surface) {
+        std::cerr << "wl_compositor_create_surface failed..." << std::endl;
+        return -1;
+    }
+    zxdg_shell_v6_listener shell_listener {
+        .ping = [](auto, auto shell, auto serial) noexcept {
+            zxdg_shell_v6_pong(shell, serial);
+        },
+    };
+    if (zxdg_shell_v6_add_listener(shell.get(), &shell_listener, nullptr) != 0) {
+        std::cerr << "xdg_shell_v6_add_listener failed..." << std::endl;
+        return -1;
+    }
+    auto xdg_surface = safe_ptr(zxdg_shell_v6_get_xdg_surface(shell.get(), surface.get()));
+    if (!xdg_surface) {
+        std::cerr << "zxdg_shell_v6_get_xdg_surface failed..." << std::endl;
+        return -1;
+    }
+    zxdg_surface_v6_listener xdg_surface_listener {
+        .configure = [](auto data, auto xdg_surface, auto serial) noexcept {
+            zxdg_surface_v6_ack_configure(xdg_surface, serial);
+        },
+    };
+    if (zxdg_surface_v6_add_listener(xdg_surface.get(), &xdg_surface_listener, nullptr) != 0) {
+        std::cerr << "zxdg_surface_v6_add_listener failed..." << std::endl;
+        return -1;
+    }
+    auto toplevel = safe_ptr(zxdg_surface_v6_get_toplevel(xdg_surface.get()));
+    if (!toplevel) {
+        std::cerr << "zxdg_surface_v6_get_toplevel failed..." << std::endl;
+        return -1;
+    }
+    auto configure = [&](int width, int height) noexcept {
+        std::cout << std::complex<long>{width, height} << std::endl;
+        if (width * height) {
+            cx = width;
+            cy = height;
+            buffer = safe_ptr(create_shm_buffer(shm.get(), cx, cy, &pixels));
+        }
+    };
+    zxdg_toplevel_v6_listener toplevel_listener = {
+        .configure = [](auto data, auto, int width, int height, auto) noexcept {
+            (*sycl::bit_cast<decltype (configure)*>(data))(width, height);
+        },
+        .close = [](auto...) noexcept { },
+    };
+    if (zxdg_toplevel_v6_add_listener(toplevel.get(), &toplevel_listener, &configure) != 0) {
+        std::cerr << "zxdg_toplevel_v6_add_listener failed..." << std::endl;
+        return -1;
+    }
+    wl_surface_commit(surface.get());
+    wl_display_roundtrip(display.get());
     auto keyboard = safe_ptr(wl_seat_get_keyboard(seat.get()));
     if (!keyboard) {
         std::cerr << "wl_seat_get_keyboard failed..." << std::endl;
@@ -166,16 +230,13 @@ int main() {
     auto keyboard_key = [&](auto k, auto s) noexcept {
         key = k;
         state = s;
-        if (k == 1 && s == 0) {
-            exit(0);
-        }
     };
     wl_keyboard_listener keyboard_listener {
         .keymap = [](auto...) noexcept { },
         .enter = [](auto...) noexcept { },
         .leave = [](auto...) noexcept { },
         .key = [](auto data, auto, auto, auto, auto... args) noexcept {
-            (*reinterpret_cast<decltype (keyboard_key)*>(data))(args...);
+            (*sycl::bit_cast<decltype (keyboard_key)*>(data))(args...);
         },
         .modifiers = [](auto...) noexcept { },
         .repeat_info = [](auto...) noexcept { },
@@ -187,87 +248,63 @@ int main() {
     auto pointer = safe_ptr(wl_seat_get_pointer(seat.get()));
     std::vector<std::complex<double>> vertices;
     vertices.push_back({});
-    auto pointer_motion = [&](auto x, auto y) noexcept {
-        vertices.front() = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
-    };
+    // auto pointer_motion = [&](auto x, auto y) noexcept {
+    //     vertices.front() = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
+    // };
     wl_pointer_listener pointer_listener = {
         .enter = [](auto...) noexcept { },
         .leave = [](auto...) noexcept { },
-        .motion = [](auto data, auto, auto, auto... args) noexcept {
-            (*reinterpret_cast<decltype (pointer_motion)*>(data))(args...);
+        .motion = [](auto data, auto, auto, auto x, auto y) noexcept {
+            auto& vertices = *sycl::bit_cast<std::vector<std::complex<double>>*>(data);
+            if (vertices.empty()) vertices.push_back({ });
+            vertices.back() = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
         },
-        .button = [](auto...) noexcept { },
+        .button = [](auto data, auto, auto, auto, auto button, auto state) noexcept {
+            if (button == BTN_RIGHT && state == 0) {
+                auto& vertices = *sycl::bit_cast<std::vector<std::complex<double>>*>(data);
+                vertices.push_back(vertices.back());
+            }
+        },
         .axis = [](auto...) noexcept { },
         .frame = [](auto...) noexcept { },
         .axis_source = [](auto...) noexcept { },
         .axis_stop = [](auto...) noexcept { },
         .axis_discrete = [](auto...) noexcept { },
     };
-    if (wl_pointer_add_listener(pointer.get(), &pointer_listener, &pointer_motion) != 0) {
+    if (wl_pointer_add_listener(pointer.get(), &pointer_listener, &vertices) != 0) {
         std::cerr << "wl_pointer_add_listener failed..." << std::endl;
         return -1;
     }
-    auto surface = safe_ptr(wl_compositor_create_surface(compositor.get()));
-    if (!surface) {
-        std::cerr << "wl_compositor_create_surface failed..." << std::endl;
-        return -1;
-    }
-    auto shell_surface = safe_ptr(wl_shell_get_shell_surface(shell.get(), surface.get()));
-    if (!shell_surface) {
-        std::cerr << "wl_shell_get_shell_surface failed..." << std::endl;
-        return -1;
-    }
-    wl_shell_surface_listener shellsurf_listener {
-        .ping = [](auto, auto shellsurf, auto serial) noexcept {
-            wl_shell_surface_pong(shellsurf, serial);
-        },
-        .configure = [](auto...) noexcept { },
-        .popup_done = [](auto...) noexcept { },
-    };
-    if (wl_shell_surface_add_listener(shell_surface.get(), &shellsurf_listener, nullptr) != 0) {
-        std::cerr << "wl_shell_surface_add_listener failed..." << std::endl;
-        return -1;
-    }
-    wl_shell_surface_set_toplevel(shell_surface.get());
-    constexpr size_t cx = 1280;
-    constexpr size_t cy =  960;
-    uint32_t* pixels = nullptr;
-    auto buffer = safe_ptr(create_shm_buffer(shm.get(), cx, cy, &pixels));
-    if (!buffer || !pixels) {
-        std::cerr << "cannot create shm-buffer..." << std::endl;
-        return -1;
-    }
-    sycl::queue que;
+    static constexpr double PI = std::numbers::pi;
+    static constexpr double TAU = PI * 2.0;
+    static constexpr double PHI = std::numbers::phi;
+    sycl::queue que{sycl::gpu_selector()};
     do {
-        constexpr double tau = std::numbers::pi * 2.0;
-        constexpr double phi = std::numbers::phi;
+        if (key == 1 && state == 0) {
+            break;
+        }
+        auto pv = sycl::buffer<uint32_t, 2>{pixels, {cy, cx}};
+        auto vv = sycl::buffer<std::complex<double>, 1>(&vertices.front(), vertices.size());
         size_t N = 256 * 256;
-        auto pix = sycl::buffer<uint8_t, 3>{reinterpret_cast<uint8_t*>(pixels), {cy, cx, 4}};
-        auto vtx = sycl::buffer<std::complex<double>, 1>(&vertices.front(), vertices.size());
         que.submit([&](auto& h) noexcept {
-            auto apix = pix.get_access<sycl::access::mode::write>(h);
-            h.parallel_for({cy, cx, 4}, [=](auto idx) noexcept {
-                // switch (idx[2]) {
-                // case 0: apix[idx] = 0xff; break;
-                // case 1:
-                // case 2: apix[idx] = 0x00; break;
-                // case 3: apix[idx] = 0xc0; break;
-                // }
-                apix[idx] = 0x00;
+            auto apv = pv.get_access<sycl::access::mode::write>(h);
+            h.parallel_for({cy, cx}, [=](auto idx) noexcept {
+                apv[idx] = 0x00000000;
             });
         });
         que.submit([&](auto& h) noexcept {
-            auto apix = pix.get_access<sycl::access::mode::write>(h);
-            auto avtx = vtx.get_access<sycl::access::mode::read>(h);
+            auto apv = pv.get_access<sycl::access::mode::write>(h);
+            auto avv = vv.get_access<sycl::access::mode::read>(h);
             h.parallel_for({vertices.size(), N}, [=](auto idx) noexcept {
                 auto n = idx[1];
-                auto pt = avtx[idx[0]] + std::polar(sqrt(n), n*tau*phi);
-                size_t y = pt.imag();
-                size_t x = pt.real();
-                apix[{y, x, 0}] = 0xff;
-                apix[{y, x, 1}] = 0xff;
-                apix[{y, x, 2}] = 0xff;
-                apix[{y, x, 3}] = 0xff;
+                auto pt = avv[idx[0]] + std::polar(sqrt(n)/3, n*TAU*PHI);
+                auto d = 1.0 - ((double)n/N);
+                auto y = pt.imag();
+                auto x = pt.real();
+                if (0 <= x && x < cx && 0 <= y && y < cy) {
+                    int b = d * 255;
+                    apv[{(size_t) y, (size_t) x}] = b | (b << 8) | (b << 16) | (b << 24);
+                }
             });
         });
         wl_surface_damage(surface.get(), 0, 0, cx, cy);
