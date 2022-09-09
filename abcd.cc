@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <linux/input-event-codes.h>
 #include <wayland-client.h>
+#include "xdg-shell.h"
 
 inline auto safe_ptr(wl_display* display) noexcept {
     return std::unique_ptr<wl_display, decltype (&wl_display_disconnect)>(display,
@@ -43,6 +44,9 @@ std::is_same_v<WL_CLIENT, wl_shm>           ||
 std::is_same_v<WL_CLIENT, wl_surface>       ||
 std::is_same_v<WL_CLIENT, wl_shell_surface> ||
 std::is_same_v<WL_CLIENT, wl_shm_pool>      ||
+std::is_same_v<WL_CLIENT, zxdg_shell_v6>    ||
+std::is_same_v<WL_CLIENT, zxdg_surface_v6>  ||
+std::is_same_v<WL_CLIENT, zxdg_toplevel_v6> ||
 std::is_same_v<WL_CLIENT, wl_buffer>
 inline auto safe_ptr(WL_CLIENT* ptr) noexcept {
     auto deleter = [](WL_CLIENT* ptr) noexcept {
@@ -105,7 +109,7 @@ int main() {
         return -1;
     }
     auto compositor = safe_ptr<wl_compositor>(nullptr);
-    auto shell = safe_ptr<wl_shell>(nullptr);
+    auto shell = safe_ptr<zxdg_shell_v6>(nullptr);
     auto seat = safe_ptr<wl_seat>(nullptr);
     auto shm = safe_ptr<wl_shm>(nullptr);
     auto register_globals = [&](auto name, std::string_view interface, auto version) noexcept {
@@ -116,11 +120,11 @@ int main() {
                                                                   &wl_compositor_interface,
                                                                   version)));
         }
-        else if (interface == wl_shell_interface.name) {
-            shell.reset(reinterpret_cast<wl_shell*>(wl_registry_bind(registry.get(),
-                                                                     name,
-                                                                     &wl_shell_interface,
-                                                                     version)));
+        else if (interface == zxdg_shell_v6_interface.name) {
+            shell.reset(reinterpret_cast<zxdg_shell_v6*>(wl_registry_bind(registry.get(),
+                                                                          name,
+                                                                          &zxdg_shell_v6_interface,
+                                                                          version)));
         }
         else if (interface == wl_seat_interface.name) {
             seat.reset(reinterpret_cast<wl_seat*>(wl_registry_bind(registry.get(),
@@ -212,23 +216,61 @@ int main() {
         std::cerr << "wl_compositor_create_surface failed..." << std::endl;
         return -1;
     }
-    auto shell_surface = safe_ptr(wl_shell_get_shell_surface(shell.get(), surface.get()));
-    if (!shell_surface) {
-        std::cerr << "wl_shell_get_shell_surface failed..." << std::endl;
-        return -1;
-    }
-    wl_shell_surface_listener shellsurf_listener {
-        .ping = [](auto, auto shellsurf, auto serial) noexcept {
-            wl_shell_surface_pong(shellsurf, serial);
+    // auto shell_surface = safe_ptr(wl_shell_get_shell_surface(shell.get(), surface.get()));
+    // if (!shell_surface) {
+    //     std::cerr << "wl_shell_get_shell_surface failed..." << std::endl;
+    //     return -1;
+    // }
+    // wl_shell_surface_listener shellsurf_listener {
+    //     .ping = [](auto, auto shellsurf, auto serial) noexcept {
+    //         wl_shell_surface_pong(shellsurf, serial);
+    //     },
+    //     .configure = [](auto...) noexcept { },
+    //     .popup_done = [](auto...) noexcept { },
+    // };
+    // if (wl_shell_surface_add_listener(shell_surface.get(), &shellsurf_listener, nullptr) != 0) {
+    //     std::cerr << "wl_shell_surface_add_listener failed..." << std::endl;
+    //     return -1;
+    // }
+    // wl_shell_surface_set_toplevel(shell_surface.get());
+    zxdg_shell_v6_listener shell_listener {
+        .ping = [](auto, auto shell, auto serial) noexcept {
+            zxdg_shell_v6_pong(shell, serial);
         },
-        .configure = [](auto...) noexcept { },
-        .popup_done = [](auto...) noexcept { },
     };
-    if (wl_shell_surface_add_listener(shell_surface.get(), &shellsurf_listener, nullptr) != 0) {
-        std::cerr << "wl_shell_surface_add_listener failed..." << std::endl;
+    if (zxdg_shell_v6_add_listener(shell.get(), &shell_listener, nullptr) != 0) {
+        std::cerr << "xdg_shell_v6_add_listener failed..." << std::endl;
         return -1;
     }
-    wl_shell_surface_set_toplevel(shell_surface.get());
+    auto xdg_surface = safe_ptr(zxdg_shell_v6_get_xdg_surface(shell.get(), surface.get()));
+    if (!xdg_surface) {
+        std::cerr << "zxdg_shell_v6_get_xdg_surface failed..." << std::endl;
+        return -1;
+    }
+    zxdg_surface_v6_listener xdg_surface_listener {
+        .configure = [](auto, auto xdg_surface, auto serial) noexcept {
+            zxdg_surface_v6_ack_configure(xdg_surface, serial);
+        },
+    };
+    if (zxdg_surface_v6_add_listener(xdg_surface.get(), &xdg_surface_listener, nullptr) != 0) {
+        std::cerr << "zxdg_surface_v6_add_listener failed..." << std::endl;
+        return -1;
+    }
+    auto toplevel = safe_ptr(zxdg_surface_v6_get_toplevel(xdg_surface.get()));
+    if (!toplevel) {
+        std::cerr << "zxdg_surface_v6_get_toplevel failed..." << std::endl;
+        return -1;
+    }
+    zxdg_toplevel_v6_listener toplevel_listener = {
+        .configure = [](auto...) noexcept { },
+        .close = [](auto...) noexcept { },
+    };
+    if (zxdg_toplevel_v6_add_listener(toplevel.get(), &toplevel_listener, nullptr) != 0) {
+        std::cerr << "zxdg_toplevel_v6_add_listener failed..." << std::endl;
+        return -1;
+    }
+    wl_surface_commit(surface.get());
+    wl_display_roundtrip(display.get());
     constexpr size_t cx = 1280;
     constexpr size_t cy =  960;
     uint32_t* pixels = nullptr;
