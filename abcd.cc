@@ -49,7 +49,7 @@ std::is_same_v<WL_CLIENT, zxdg_toplevel_v6> ||
 std::is_same_v<WL_CLIENT, wl_buffer>
 inline auto safe_ptr(WL_CLIENT* ptr) noexcept {
     auto deleter = [](WL_CLIENT* ptr) noexcept {
-        wl_proxy_destroy(sycl::bit_cast<wl_proxy*>(ptr));
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(ptr));
     };
     return std::unique_ptr<WL_CLIENT, decltype (deleter)>(ptr, deleter);
 }
@@ -140,7 +140,7 @@ int main() {
     };
     wl_registry_listener listener {
         .global = [](auto data, auto, auto... args) noexcept {
-            (*sycl::bit_cast<decltype (register_globals)*>(data))(args...);
+            (*reinterpret_cast<decltype (register_globals)*>(data))(args...);
         },
         .global_remove = [](auto...) noexcept {
             std::cerr << "Required global has been removed..." << std::endl;
@@ -210,7 +210,7 @@ int main() {
     };
     zxdg_toplevel_v6_listener toplevel_listener = {
         .configure = [](auto data, auto, int width, int height, auto) noexcept {
-            (*sycl::bit_cast<decltype (configure)*>(data))(width, height);
+            (*reinterpret_cast<decltype (configure)*>(data))(width, height);
         },
         .close = [](auto...) noexcept { },
     };
@@ -236,7 +236,7 @@ int main() {
         .enter = [](auto...) noexcept { },
         .leave = [](auto...) noexcept { },
         .key = [](auto data, auto, auto, auto, auto... args) noexcept {
-            (*sycl::bit_cast<decltype (keyboard_key)*>(data))(args...);
+            (*reinterpret_cast<decltype (keyboard_key)*>(data))(args...);
         },
         .modifiers = [](auto...) noexcept { },
         .repeat_info = [](auto...) noexcept { },
@@ -248,20 +248,17 @@ int main() {
     auto pointer = safe_ptr(wl_seat_get_pointer(seat.get()));
     std::vector<std::complex<double>> vertices;
     vertices.push_back({});
-    // auto pointer_motion = [&](auto x, auto y) noexcept {
-    //     vertices.front() = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
-    // };
     wl_pointer_listener pointer_listener = {
         .enter = [](auto...) noexcept { },
         .leave = [](auto...) noexcept { },
         .motion = [](auto data, auto, auto, auto x, auto y) noexcept {
-            auto& vertices = *sycl::bit_cast<std::vector<std::complex<double>>*>(data);
+            auto& vertices = *reinterpret_cast<std::vector<std::complex<double>>*>(data);
             if (vertices.empty()) vertices.push_back({ });
             vertices.back() = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
         },
         .button = [](auto data, auto, auto, auto, auto button, auto state) noexcept {
             if (button == BTN_RIGHT && state == 0) {
-                auto& vertices = *sycl::bit_cast<std::vector<std::complex<double>>*>(data);
+                auto& vertices = *reinterpret_cast<std::vector<std::complex<double>>*>(data);
                 vertices.push_back(vertices.back());
             }
         },
@@ -293,7 +290,7 @@ int main() {
             });
         });
         que.submit([&](auto& h) noexcept {
-            auto apv = pv.get_access<sycl::access::mode::write>(h);
+            auto apv = pv.get_access<sycl::access::mode::read_write>(h);
             auto avv = vv.get_access<sycl::access::mode::read>(h);
             h.parallel_for({vertices.size(), N}, [=](auto idx) noexcept {
                 auto n = idx[1];
@@ -302,8 +299,12 @@ int main() {
                 auto y = pt.imag();
                 auto x = pt.real();
                 if (0 <= x && x < cx && 0 <= y && y < cy) {
-                    int b = d * 255;
-                    apv[{(size_t) y, (size_t) x}] = b | (b << 8) | (b << 16) | (b << 24);
+                    uint8_t b = d * 255;
+                    auto v = reinterpret_cast<uint8_t*>(&apv[{(size_t) y, (size_t) x}]);
+                    v[0] = std::max(v[0], b);
+                    v[1] = std::max(v[1], b);
+                    v[2] = std::max(v[2], b);
+                    v[3] = std::max(v[3], b);
                 }
             });
         });
