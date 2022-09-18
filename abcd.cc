@@ -16,7 +16,7 @@
 #include <sys/mman.h>
 #include <linux/input-event-codes.h>
 #include <wayland-client.h>
-#include "xdg-shell.h"
+#include "xdg-shell-client.h"
 
 inline auto safe_ptr(wl_display* display) noexcept {
     return std::unique_ptr<wl_display, decltype (&wl_display_disconnect)>(display,
@@ -211,28 +211,30 @@ int main() {
         std::cerr << "wl_pointer_add_listener failed..." << std::endl;
         return -1;
     }
+    auto touch = safe_ptr(wl_seat_get_touch(seat.get()));
+    auto touch_motion = [&](auto x, auto y) noexcept {
+        vertices.front() = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
+    };
+    wl_touch_listener touch_listener = {
+        .down = [](auto...) noexcept { },
+        .up = [](auto...) noexcept { },
+        .motion = [](auto data, auto, auto, auto, auto... args) noexcept {
+            (*reinterpret_cast<decltype (touch_motion)*>(data))(args...);
+        },
+        .frame = [](auto...) noexcept { },
+        .cancel = [](auto...) noexcept { },
+        .shape = [](auto...) noexcept { },
+        .orientation = [](auto...) noexcept { },
+    };
+    if (wl_touch_add_listener(touch.get(), &touch_listener, &touch_motion) != 0) {
+        std::cerr << "wl_touch_add_listener failed..." << std::endl;
+        return -1;
+    }
     auto surface = safe_ptr(wl_compositor_create_surface(compositor.get()));
     if (!surface) {
         std::cerr << "wl_compositor_create_surface failed..." << std::endl;
         return -1;
     }
-    // auto shell_surface = safe_ptr(wl_shell_get_shell_surface(shell.get(), surface.get()));
-    // if (!shell_surface) {
-    //     std::cerr << "wl_shell_get_shell_surface failed..." << std::endl;
-    //     return -1;
-    // }
-    // wl_shell_surface_listener shellsurf_listener {
-    //     .ping = [](auto, auto shellsurf, auto serial) noexcept {
-    //         wl_shell_surface_pong(shellsurf, serial);
-    //     },
-    //     .configure = [](auto...) noexcept { },
-    //     .popup_done = [](auto...) noexcept { },
-    // };
-    // if (wl_shell_surface_add_listener(shell_surface.get(), &shellsurf_listener, nullptr) != 0) {
-    //     std::cerr << "wl_shell_surface_add_listener failed..." << std::endl;
-    //     return -1;
-    // }
-    // wl_shell_surface_set_toplevel(shell_surface.get());
     zxdg_shell_v6_listener shell_listener {
         .ping = [](auto, auto shell, auto serial) noexcept {
             zxdg_shell_v6_pong(shell, serial);
@@ -256,46 +258,49 @@ int main() {
         std::cerr << "zxdg_surface_v6_add_listener failed..." << std::endl;
         return -1;
     }
-    auto toplevel = safe_ptr(zxdg_surface_v6_get_toplevel(xdg_surface.get()));
-    if (!toplevel) {
-        std::cerr << "zxdg_surface_v6_get_toplevel failed..." << std::endl;
-        return -1;
-    }
-    zxdg_toplevel_v6_listener toplevel_listener = {
-        .configure = [](auto...) noexcept { },
-        .close = [](auto...) noexcept { },
-    };
-    if (zxdg_toplevel_v6_add_listener(toplevel.get(), &toplevel_listener, nullptr) != 0) {
-        std::cerr << "zxdg_toplevel_v6_add_listener failed..." << std::endl;
-        return -1;
-    }
-    wl_surface_commit(surface.get());
-    wl_display_roundtrip(display.get());
-    constexpr size_t cx = 1280;
-    constexpr size_t cy =  960;
+    size_t cx = 1280;
+    size_t cy =  960;
     uint32_t* pixels = nullptr;
     auto buffer = safe_ptr(create_shm_buffer(shm.get(), cx, cy, &pixels));
     if (!buffer || !pixels) {
         std::cerr << "cannot create shm-buffer..." << std::endl;
         return -1;
     }
+    auto configure = [&](auto width, auto height) noexcept {
+        if (0 < width * height) {
+            cx = width;
+            cy = height;
+            buffer.reset(create_shm_buffer(shm.get(), cx, cy, &pixels));
+        }
+    };
+    auto toplevel = safe_ptr(zxdg_surface_v6_get_toplevel(xdg_surface.get()));
+    if (!toplevel) {
+        std::cerr << "zxdg_surface_v6_get_toplevel failed..." << std::endl;
+        return -1;
+    }
+    zxdg_toplevel_v6_listener toplevel_listener = {
+        .configure = [](auto data, auto, auto width, auto height, auto) noexcept {
+            (*reinterpret_cast<decltype (configure)*>(data))(width, height);
+        },
+        .close = [](auto...) noexcept { },
+    };
+    if (zxdg_toplevel_v6_add_listener(toplevel.get(), &toplevel_listener, &configure) != 0) {
+        std::cerr << "zxdg_toplevel_v6_add_listener failed..." << std::endl;
+        return -1;
+    }
+    wl_surface_commit(surface.get());
+    wl_display_roundtrip(display.get());
     sycl::queue que;
     do {
         constexpr double tau = std::numbers::pi * 2.0;
         constexpr double phi = std::numbers::phi;
-        size_t N = 256 * 256;
-        auto pix = sycl::buffer<uint8_t, 3>{reinterpret_cast<uint8_t*>(pixels), {cy, cx, 4}};
+        size_t N = 256*256;
+        auto pix = sycl::buffer<uint32_t, 2>{pixels, {cy, cx}};
         auto vtx = sycl::buffer<std::complex<double>, 1>(&vertices.front(), vertices.size());
         que.submit([&](auto& h) noexcept {
             auto apix = pix.get_access<sycl::access::mode::write>(h);
-            h.parallel_for({cy, cx, 4}, [=](auto idx) noexcept {
-                // switch (idx[2]) {
-                // case 0: apix[idx] = 0xff; break;
-                // case 1:
-                // case 2: apix[idx] = 0x00; break;
-                // case 3: apix[idx] = 0xc0; break;
-                // }
-                apix[idx] = 0x00;
+            h.parallel_for({cy, cx}, [=](auto idx) noexcept {
+                apix[idx] = 0x00000000;
             });
         });
         que.submit([&](auto& h) noexcept {
@@ -303,13 +308,13 @@ int main() {
             auto avtx = vtx.get_access<sycl::access::mode::read>(h);
             h.parallel_for({vertices.size(), N}, [=](auto idx) noexcept {
                 auto n = idx[1];
-                auto pt = avtx[idx[0]] + std::polar(sqrt(n), n*tau*phi);
-                size_t y = pt.imag();
-                size_t x = pt.real();
-                apix[{y, x, 0}] = 0xff;
-                apix[{y, x, 1}] = 0xff;
-                apix[{y, x, 2}] = 0xff;
-                apix[{y, x, 3}] = 0xff;
+                auto pt = avtx[idx[0]] + std::polar(sqrt(n)/3.14, n*tau*phi);
+                auto y = pt.imag();
+                auto x = pt.real();
+                uint32_t br = 255 - n * 255 / N;
+		if (0 < x && x < cx && 0 < y && y < cy) {
+                    apix[{(size_t) y, (size_t) x}] = br | br << 8 | br << 16 | br << 24;
+                }
             });
         });
         wl_surface_damage(surface.get(), 0, 0, cx, cy);
